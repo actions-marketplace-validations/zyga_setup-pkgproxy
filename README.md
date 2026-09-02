@@ -30,15 +30,33 @@ the payload cache at the end of the job.
   # version: defaults to this action's pinned pkgproxy release; only pass it
   # to override.
 
-# ... later, after the job's real work, save the payload cache only on a
-# miss (GitHub caches are immutable, so re-saving an exact hit is wasted
-# writes) — restore-keys already lets a partial cache warm the next run:
+# ... later, after the job's real work:
+
+# pkgproxy.service runs as root, so everything under cache-dir is root-owned
+# while the daemon is up. Stop it and hand the directory back to the runner
+# user first, or actions/cache/save (which runs unprivileged) can fail to
+# read it.
+- name: Prepare pkgproxy cache for saving
+  if: always()
+  shell: bash
+  run: |
+    sudo systemctl stop pkgproxy.service || true
+    sudo chown -R "$USER:$USER" ${{ steps.pkgproxy.outputs.cache-dir }}
+
+# Save only on a miss (GitHub caches are immutable, so re-saving an exact
+# hit is wasted writes) — restore-keys already lets a partial cache warm
+# the next run:
 - if: steps.pkgproxy.outputs.package-cache-hit != 'true'
   uses: actions/cache/save@v6
   with:
     path: ${{ steps.pkgproxy.outputs.cache-dir }}
     key: ${{ steps.pkgproxy.outputs.package-cache-key-success }}
 ```
+
+If the job can fail after the cache is warmed but before it would normally
+be saved, save under `package-cache-key-partial` instead in an `if: failure()`
+step, so the next run's `restore-keys` fallback still picks up that partial
+progress.
 
 ## Inputs
 
