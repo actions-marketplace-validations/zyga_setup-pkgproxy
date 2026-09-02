@@ -69,6 +69,9 @@ outputs:
   package-cache-key-partial:
     description: The stable per-arch package-cache key to save under when the job fails.
     value: ${{ steps.keys.outputs.package-cache-key-partial }}
+branding:
+  icon: package
+  color: purple
 runs:
   using: composite
   steps:
