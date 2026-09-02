@@ -58,6 +58,118 @@ be saved, save under `package-cache-key-partial` instead in an `if: failure()`
 step, so the next run's `restore-keys` fallback still picks up that partial
 progress.
 
+## Setting up each proxy client
+
+`configure-host: true` (the default) already runs `pkgproxyctl setup apt` and
+`pkgproxyctl setup snap` on the runner for you. Everything below is what you
+run yourself with `${{ steps.pkgproxy.outputs.addr }}`, for the remaining
+targets — or for apt/snap too if you set `configure-host: false` (e.g.
+because you want to configure a container instead of the host).
+
+### apt
+
+```yaml
+- run: pkgproxyctl setup apt -addr "${{ steps.pkgproxy.outputs.addr }}" | sudo sh
+```
+
+Not needed if `configure-host` is left at its default `true`.
+
+### snap
+
+```yaml
+- run: pkgproxyctl setup snap -addr "${{ steps.pkgproxy.outputs.addr }}" | sudo sh
+```
+
+Not needed if `configure-host` is left at its default `true`.
+
+### go
+
+```yaml
+- run: pkgproxyctl setup go -addr "${{ steps.pkgproxy.outputs.addr }}" | sh
+```
+
+Points `GOPROXY` at pkgproxy for the invoking user (`go env -w`, a per-user
+config file — no `sudo` needed).
+
+### lxd — containers as pkgproxy clients
+
+Routes apt/snap/go traffic from *inside* LXD containers through pkgproxy —
+the opposite direction from `lxd-remote` below. Used by anything that
+launches build containers via LXD:
+
+```yaml
+- run: pkgproxyctl setup lxd -addr "${{ steps.pkgproxy.outputs.addr }}" | sudo sh
+```
+
+With no `-project`, this creates a standalone `pkgproxy` LXD profile that you
+attach explicitly (`lxc launch ... --profile pkgproxy`, or add it to a
+container's profile list). Pass `-project <name>` instead to patch that
+project's `default` profile directly, so every container launched in it uses
+pkgproxy automatically — see `snapcraft` below, which is exactly this with
+`-project snapcraft` hardwired in.
+
+### lxd-remote — LXD itself as a pkgproxy client
+
+Adds pkgproxy as a cached LXD image-server remote (`lxc remote add`) — the
+opposite direction from `lxd`/`snapcraft`. Run as the user whose LXD client
+config you're setting up (no `sudo`):
+
+```yaml
+- run: |
+    lxc remote list >/dev/null  # make sure the LXD client config dir exists first
+    pkgproxyctl setup lxd-remote -addr "${{ steps.pkgproxy.outputs.addr }}" | sh
+```
+
+A plain `lxc remote add --accept-certificate` doesn't work for
+`--protocol=simplestreams` (the flag is silently ignored) — this is why the
+setup script exists at all: it pins pkgproxy's self-signed certificate for
+you. Once added, pkgproxy also transparently proxies the exact remote names
+`craft-providers` (snapcraft/rockcraft/charmcraft's LXD provisioner) already
+uses for build-base images, so those tools get pkgproxy's cache for free
+with no config on their side.
+
+### snapcraft — extra steps required
+
+`pkgproxyctl setup snapcraft` is `pkgproxyctl setup lxd -project snapcraft`
+under the hood: snapcraft/craft-providers always builds in an LXD project
+literally named `snapcraft`, so this shorthand saves you from needing to
+know that convention. But craft-providers creates that project **lazily**,
+only when `snapcraft pack` first needs it — so unlike the plain `lxd` case,
+you must pre-create the project and its `default` profile's network/disk
+devices yourself first, or `setup snapcraft` has no profile to patch:
+
+```yaml
+- name: Pre-create the snapcraft LXD project
+  run: |
+    lxc project create snapcraft || true
+    lxc profile device add default root disk path=/ pool=default --project snapcraft || true
+    lxc profile device add default eth0 nic network=lxdbr0 name=eth0 --project snapcraft || true
+
+- name: Configure pkgproxy for snapcraft build containers
+  run: pkgproxyctl setup snapcraft -addr "${{ steps.pkgproxy.outputs.addr }}" | sudo sh
+```
+
+Then **verify it actually took**, before running `snapcraft pack`. The setup
+step injects a `raw.lxc` pre-start hook into the profile; if that hook is
+missing or not executable, the failure won't surface here — it surfaces
+minutes later, deep inside the build, as an opaque `lxd forkstart ... exit
+status 1`:
+
+```yaml
+- name: Verify the LXC pre-start hook was provisioned
+  run: |
+    HOOK_PATH=$(lxc profile get default raw.lxc --project snapcraft | sed -n 's/^lxc.hook.pre-start = //p')
+    if [ -z "$HOOK_PATH" ] || ! sudo test -x "$HOOK_PATH"; then
+      echo "::error::pkgproxy pre-start hook not provisioned/executable at '${HOOK_PATH}'" >&2
+      exit 1
+    fi
+```
+
+Add `lxd-remote` too (see above) if you also want pkgproxy's cache to serve
+the build-base images craft-providers downloads, not just the apt/snap/go
+traffic from inside the container — the two setups are independent and can
+run in either order, as long as both finish before `snapcraft pack` runs.
+
 ## Inputs
 
 | Input               | Default            | Description                                                                 |
